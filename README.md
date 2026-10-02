@@ -31,7 +31,19 @@ npm install
 npm start
 ```
 
-Open http://localhost:3000. The first time you open it, Beaver asks you to create the admin account, which goes in at Level 1. Then go to **Settings**:
+Open http://localhost:3000. The first time you open it, Beaver asks you to create the admin account, which goes in at Level 1.
+
+**Or set your login with environment variables.** Copy `.env.example` to `.env` and fill in your username and password, then run `npm start`. Beaver creates that admin account the first time it starts, so you can sign in straight away:
+
+```
+BEAVER_ADMIN_USERNAME=admin
+BEAVER_ADMIN_PASSWORD=change-me-please
+BEAVER_ADMIN_NAME=Admin
+```
+
+`.env` is never committed to git. Forgot the password? Put the new one in `.env`, set `BEAVER_ADMIN_RESET_PASSWORD=true`, restart once, then set it back to `false`.
+
+Then go to **Settings**:
 
 1. **Levels**: rename the default levels (*Leadership*, *Team*), add more, reorder them, and tick which levels each level can submit tasks to.
 2. **Team members**: add people with a username, temporary password and level. They can change their password under *My account*.
@@ -45,6 +57,12 @@ Open http://localhost:3000. The first time you open it, Beaver asks you to creat
 | `HOST`        | `0.0.0.0`         | Interface to bind |
 | `BEAVER_DB`   | `./data/beaver.db`| Where the database file lives |
 | `TRUST_PROXY` | *(off)*           | Set to `1` behind a reverse proxy that terminates HTTPS, so sign-in cookies are marked secure |
+| `BEAVER_ADMIN_USERNAME` | *(none)* | Admin login to create on first start |
+| `BEAVER_ADMIN_PASSWORD` | *(none)* | Its password (at least 6 characters) |
+| `BEAVER_ADMIN_NAME` | username | Display name for that admin |
+| `BEAVER_ADMIN_RESET_PASSWORD` | `false` | `true` resets that admin's password to `BEAVER_ADMIN_PASSWORD` on start (for when you're locked out) |
+
+You can put any of these in a `.env` file next to `package.json`. `npm start` loads it automatically.
 
 ## Hosting it yourself
 
@@ -62,7 +80,8 @@ Open http://localhost:3000. The first time you open it, Beaver asks you to creat
 
 ```bash
 docker build -t beaver .
-docker run -d --name beaver -p 3000:3000 -v beaver-data:/data --restart unless-stopped beaver
+docker run -d --name beaver -p 3000:3000 -v beaver-data:/data --restart unless-stopped \
+  -e BEAVER_ADMIN_USERNAME=admin -e BEAVER_ADMIN_PASSWORD='your-password' beaver
 ```
 
 **HTTPS.** If people reach Beaver over the internet, put it behind a reverse proxy with HTTPS (Caddy, nginx, IIS) and set `TRUST_PROXY=1`. Here's a minimal Caddyfile:

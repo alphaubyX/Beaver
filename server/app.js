@@ -98,7 +98,7 @@ function cleanPrefs(input) {
 
 // ---------- app ----------
 
-function createApp({ dbFile = ':memory:', trustProxy = false } = {}) {
+function createApp({ dbFile = ':memory:', trustProxy = false, admin: envAdmin = null } = {}) {
   const db = openDb(dbFile);
   const app = express();
   app.set('trust proxy', trustProxy);
@@ -277,15 +277,9 @@ function createApp({ dbFile = ':memory:', trustProxy = false } = {}) {
     if (entry.count > 10) fail(429, 'Too many sign-in attempts. Try again in a few minutes.');
   }
 
-  // ----- setup & auth -----
-
-  app.get('/api/setup', route(() => ({ needsSetup: q.userCount.get().n === 0 })));
-
-  app.post('/api/setup', route((req, res) => {
-    const name = str(req.body.name, { field: 'Name', max: 80, required: true });
-    const uname = username(req.body.username);
-    const pw = password(req.body.password);
-    const user = tx(db, () => {
+  /** Create the default levels and the first admin (Level 1). Only allowed on an empty database. */
+  function createFirstAdmin(name, uname, pw) {
+    return tx(db, () => {
       if (q.userCount.get().n > 0) fail(409, 'Setup has already been completed');
       const top = createLevel('Leadership');
       createLevel('Team');
@@ -294,6 +288,57 @@ function createApp({ dbFile = ':memory:', trustProxy = false } = {}) {
       ).run(uname, name, hashPassword(pw), top, pick(AVATAR_COLORS), now());
       return q.userById.get(lastInsertRowid);
     });
+  }
+
+  /**
+   * Admin account from environment variables (BEAVER_ADMIN_*):
+   * created on an empty database; on an existing one its password is only reset when resetPassword is set.
+   */
+  function applyAdminFromEnv({ name, username: rawUsername, password: rawPassword, resetPassword }) {
+    const uname = username(rawUsername);
+    const pw = password(rawPassword);
+    if (q.userCount.get().n === 0) {
+      createFirstAdmin(str(name, { field: 'Name', max: 80 }) || uname, uname, pw);
+      return `Created admin account "${uname}"`;
+    }
+    const existing = q.userByName.get(uname);
+    if (!resetPassword) {
+      return existing
+        ? `Admin account "${uname}" already exists; its password was left unchanged`
+        : `Users already exist, so "${uname}" was not created (add members in Settings)`;
+    }
+    if (existing) {
+      db.prepare('UPDATE users SET password_hash = ?, is_admin = 1, active = 1 WHERE id = ?').run(hashPassword(pw), existing.id);
+      db.prepare('DELETE FROM sessions WHERE user_id = ?').run(existing.id);
+      return `Reset the password of "${uname}"`;
+    }
+    const top = q.levels.all()[0]?.id ?? createLevel('Leadership');
+    db.prepare(
+      'INSERT INTO users (username, name, password_hash, level_id, is_admin, color, created_at) VALUES (?, ?, ?, ?, 1, ?, ?)'
+    ).run(uname, str(name, { field: 'Name', max: 80 }) || uname, hashPassword(pw), top, pick(AVATAR_COLORS), now());
+    return `Created admin account "${uname}"`;
+  }
+
+  if (envAdmin?.username || envAdmin?.password) {
+    if (!envAdmin.username || !envAdmin.password) {
+      throw new Error('Set both BEAVER_ADMIN_USERNAME and BEAVER_ADMIN_PASSWORD (or neither).');
+    }
+    try {
+      app.locals.adminMessage = applyAdminFromEnv(envAdmin);
+    } catch (err) {
+      throw new Error(`Invalid admin settings: ${err.message}`);
+    }
+  }
+
+  // ----- setup & auth -----
+
+  app.get('/api/setup', route(() => ({ needsSetup: q.userCount.get().n === 0 })));
+
+  app.post('/api/setup', route((req, res) => {
+    const name = str(req.body.name, { field: 'Name', max: 80, required: true });
+    const uname = username(req.body.username);
+    const pw = password(req.body.password);
+    const user = createFirstAdmin(name, uname, pw);
     startSession(res, req, user.id);
     return { user: publicUser(user) };
   }));

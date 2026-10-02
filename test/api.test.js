@@ -141,3 +141,41 @@ test('mutations must be JSON', async (t) => {
   });
   assert.equal(res.status, 415);
 });
+
+test('admin account from environment variables', async (t) => {
+  const os = require('node:os');
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beaver-'));
+  const dbFile = path.join(dir, 'beaver.db');
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  const login = async (app, password) => {
+    const server = await new Promise((resolve) => { const s = app.listen(0, '127.0.0.1', () => resolve(s)); });
+    try {
+      const res = await fetch(`http://127.0.0.1:${server.address().port}/api/login`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ username: 'owner', password }),
+      });
+      return { status: res.status, data: await res.json() };
+    } finally { server.close(); }
+  };
+
+  // Empty database: admin is created at Level 1.
+  let app = createApp({ dbFile, admin: { username: 'owner', password: 'first-pass', name: 'The Owner' } });
+  assert.match(app.locals.adminMessage, /Created/);
+  const first = await login(app, 'first-pass');
+  assert.equal(first.status, 200);
+  assert.equal(first.data.user.isAdmin, true);
+  assert.equal(first.data.user.name, 'The Owner');
+
+  // Restart with a different password: unchanged unless reset is requested.
+  app = createApp({ dbFile, admin: { username: 'owner', password: 'second-pass' } });
+  assert.equal((await login(app, 'second-pass')).status, 401);
+  app = createApp({ dbFile, admin: { username: 'owner', password: 'second-pass', resetPassword: true } });
+  assert.equal((await login(app, 'second-pass')).status, 200);
+
+  // Bad settings stop the server with a clear message.
+  assert.throws(() => createApp({ dbFile, admin: { username: 'owner' } }), /BEAVER_ADMIN_PASSWORD/);
+  assert.throws(() => createApp({ dbFile, admin: { username: 'owner', password: '123' } }), /at least 6/);
+});
