@@ -3,7 +3,7 @@
 const path = require('node:path');
 const crypto = require('node:crypto');
 const express = require('express');
-const { openDb, tx } = require('./db');
+const { openDb } = require('./db');
 
 const SESSION_DAYS = 30;
 const COOKIE = 'beaver_sid';
@@ -98,23 +98,29 @@ function cleanPrefs(input) {
 
 // ---------- app ----------
 
-function createApp({ dbFile = ':memory:', trustProxy = false, admin: envAdmin = null } = {}) {
-  const db = openDb(dbFile);
+/**
+ * Build the Express app. The database opens in the background; requests wait for it via `app.locals.ready`.
+ * @param {object} opts
+ * @param {string} [opts.dbFile] file path, ":memory:" or libSQL URL
+ * @param {string} [opts.dbAuthToken] auth token for a remote libSQL/Turso database
+ * @param {object} [opts.admin] admin login from environment variables
+ * @param {boolean} [opts.ephemeral] storage is temporary (shown as a warning in the UI)
+ */
+function createApp({ dbFile = ':memory:', dbAuthToken, trustProxy = false, admin: envAdmin = null, ephemeral = false } = {}) {
   const app = express();
+  app.locals.ephemeral = ephemeral;
   app.set('trust proxy', trustProxy);
   app.disable('x-powered-by');
-  app.locals.db = db;
+
+  let db;
 
   const q = {
-    userById: db.prepare('SELECT * FROM users WHERE id = ?'),
-    userByName: db.prepare('SELECT * FROM users WHERE username = ?'),
-    userCount: db.prepare('SELECT COUNT(*) AS n FROM users'),
-    levels: db.prepare('SELECT * FROM levels ORDER BY rank'),
-    levelById: db.prepare('SELECT * FROM levels WHERE id = ?'),
-    rules: db.prepare('SELECT from_level, to_level FROM level_rules'),
-    ruleExists: db.prepare('SELECT 1 FROM level_rules WHERE from_level = ? AND to_level = ?'),
-    session: db.prepare('SELECT * FROM sessions WHERE token = ?'),
-    taskById: db.prepare('SELECT * FROM tasks WHERE id = ?'),
+    userById: (id) => db.get('SELECT * FROM users WHERE id = ?', [id]),
+    userByName: (name) => db.get('SELECT * FROM users WHERE username = ?', [name]),
+    userCount: async () => (await db.get('SELECT COUNT(*) AS n FROM users')).n,
+    levels: () => db.all('SELECT * FROM levels ORDER BY rank'),
+    levelById: (id) => db.get('SELECT * FROM levels WHERE id = ?', [id]),
+    taskById: (id) => db.get('SELECT * FROM tasks WHERE id = ?', [id]),
   };
 
   // ----- helpers bound to db -----
@@ -131,9 +137,9 @@ function createApp({ dbFile = ':memory:', trustProxy = false, admin: envAdmin = 
     };
   }
 
-  function levelsWithRules() {
-    const rules = q.rules.all();
-    return q.levels.all().map((l) => ({
+  async function levelsWithRules() {
+    const [levels, rules] = await Promise.all([q.levels(), db.all('SELECT from_level, to_level FROM level_rules')]);
+    return levels.map((l) => ({
       id: l.id,
       name: l.name,
       rank: l.rank,
@@ -142,26 +148,19 @@ function createApp({ dbFile = ':memory:', trustProxy = false, admin: envAdmin = 
   }
 
   /** Can `from` submit tasks to `to`? Everyone can always write notes for themselves. */
-  function canAssign(from, to) {
+  async function canAssign(from, to) {
     if (!to || !to.active) return false;
     if (from.id === to.id) return true;
     if (!from.level_id || !to.level_id) return false;
-    return !!q.ruleExists.get(from.level_id, to.level_id);
+    return !!(await db.get('SELECT 1 AS ok FROM level_rules WHERE from_level = ? AND to_level = ?', [from.level_id, to.level_id]));
   }
 
-  function renumberLevels() {
-    db.prepare('SELECT id FROM levels ORDER BY rank, id').all()
-      .forEach((l, i) => db.prepare('UPDATE levels SET rank = ? WHERE id = ?').run(i + 1, l.id));
-  }
-
-  function createLevel(name) {
-    const { maxRank } = db.prepare('SELECT COALESCE(MAX(rank), 0) AS maxRank FROM levels').get();
-    const { lastInsertRowid: id } = db.prepare('INSERT INTO levels (name, rank) VALUES (?, ?)').run(name, maxRank + 1);
-    // New (lowest) level may assign within itself; every level above it may assign down to it.
-    const insertRule = db.prepare('INSERT OR IGNORE INTO level_rules (from_level, to_level) VALUES (?, ?)');
-    for (const l of q.levels.all()) insertRule.run(l.id, id);
-    return Number(id);
-  }
+  // Statements that add a level at the bottom of the hierarchy. The new level may assign within itself,
+  // and every existing level may assign down to it.
+  const addLevelStatements = (name) => [
+    ['INSERT INTO levels (name, rank) SELECT ?, COALESCE(MAX(rank), 0) + 1 FROM levels', [name]],
+    ['INSERT OR IGNORE INTO level_rules (from_level, to_level) SELECT id, (SELECT MAX(id) FROM levels) FROM levels'],
+  ];
 
   function serializeTask(t) {
     return {
@@ -187,16 +186,16 @@ function createApp({ dbFile = ':memory:', trustProxy = false, admin: envAdmin = 
   }
 
   /** Can viewer see another member's self-written (non-private) notes? Same rule as assigning. */
-  function canOversee(viewer, member) {
+  async function canOversee(viewer, member) {
     return viewer.id !== member.id && canAssign(viewer, member);
   }
 
-  function canView(viewer, t) {
+  async function canView(viewer, t) {
     if (t.created_by === viewer.id) return true;
     if (t.is_private) return false;
     if (t.assigned_to === viewer.id) return true;
     if (t.created_by === t.assigned_to) {
-      const owner = q.userById.get(t.created_by);
+      const owner = await q.userById(t.created_by);
       return !!owner && canOversee(viewer, owner);
     }
     return false;
@@ -204,10 +203,10 @@ function createApp({ dbFile = ':memory:', trustProxy = false, admin: envAdmin = 
 
   // ----- sessions -----
 
-  function startSession(res, req, userId) {
+  async function startSession(res, req, userId) {
     const token = crypto.randomBytes(32).toString('base64url');
     const expires = new Date(Date.now() + SESSION_DAYS * 864e5);
-    db.prepare('INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)').run(token, userId, expires.toISOString());
+    await db.run('INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)', [token, userId, expires.toISOString()]);
     res.cookie(COOKIE, token, {
       httpOnly: true,
       sameSite: 'lax',
@@ -226,7 +225,100 @@ function createApp({ dbFile = ':memory:', trustProxy = false, admin: envAdmin = 
     return null;
   }
 
+  // ----- first admin -----
+
+  /** Create the default levels and the first admin (Level 1). Only allowed on an empty database. */
+  async function createFirstAdmin(name, uname, pw) {
+    const noUsers = 'NOT EXISTS (SELECT 1 FROM users)';
+    const results = await db.batch([
+      [`INSERT INTO levels (name, rank) SELECT 'Leadership', 1 WHERE ${noUsers}`],
+      [`INSERT INTO levels (name, rank) SELECT 'Team', 2 WHERE ${noUsers}`],
+      [`INSERT OR IGNORE INTO level_rules (from_level, to_level)
+        SELECT a.id, b.id FROM levels a JOIN levels b ON b.rank >= a.rank WHERE ${noUsers}`],
+      [`INSERT INTO users (username, name, password_hash, level_id, is_admin, color, created_at)
+        SELECT ?, ?, ?, (SELECT id FROM levels ORDER BY rank LIMIT 1), 1, ?, ? WHERE ${noUsers}`,
+      [uname, name, hashPassword(pw), pick(AVATAR_COLORS), now()]],
+    ]);
+    if (!results[3].changes) fail(409, 'Setup has already been completed');
+    return q.userByName(uname);
+  }
+
+  /**
+   * Admin account from environment variables (BEAVER_ADMIN_*):
+   * created on an empty database; on an existing one its password is only reset when resetPassword is set.
+   */
+  async function applyAdminFromEnv({ name, username: rawUsername, password: rawPassword, resetPassword }) {
+    const uname = username(rawUsername);
+    const pw = password(rawPassword);
+    const displayName = str(name, { field: 'Name', max: 80 }) || uname;
+    if ((await q.userCount()) === 0) {
+      await createFirstAdmin(displayName, uname, pw);
+      return `Created admin account "${uname}"`;
+    }
+    const existing = await q.userByName(uname);
+    if (!resetPassword) {
+      return existing
+        ? `Admin account "${uname}" already exists; its password was left unchanged`
+        : `Users already exist, so "${uname}" was not created (add members in Settings)`;
+    }
+    if (existing) {
+      await db.batch([
+        ['UPDATE users SET password_hash = ?, is_admin = 1, active = 1 WHERE id = ?', [hashPassword(pw), existing.id]],
+        ['DELETE FROM sessions WHERE user_id = ?', [existing.id]],
+      ]);
+      return `Reset the password of "${uname}"`;
+    }
+    if (!(await q.levels()).length) await db.batch(addLevelStatements('Leadership'));
+    await db.run(
+      `INSERT INTO users (username, name, password_hash, level_id, is_admin, color, created_at)
+       VALUES (?, ?, ?, (SELECT id FROM levels ORDER BY rank LIMIT 1), 1, ?, ?)`,
+      [uname, displayName, hashPassword(pw), pick(AVATAR_COLORS), now()],
+    );
+    return `Created admin account "${uname}"`;
+  }
+
+  async function init() {
+    if (envAdmin?.username || envAdmin?.password) {
+      if (!envAdmin.username || !envAdmin.password) {
+        throw new Error('Set both BEAVER_ADMIN_USERNAME and BEAVER_ADMIN_PASSWORD (or neither).');
+      }
+      try {
+        username(envAdmin.username);
+        password(envAdmin.password);
+      } catch (err) {
+        throw new Error(`Invalid admin settings: ${err.message}`);
+      }
+    }
+    db = await openDb(dbFile, { authToken: dbAuthToken });
+    app.locals.db = db;
+    if (envAdmin?.username) app.locals.adminMessage = await applyAdminFromEnv(envAdmin);
+  }
+
+  app.locals.ready = init();
+  app.locals.ready.catch(() => {}); // callers report the error; avoid an unhandled rejection here
+
   // ----- middleware -----
+
+  const route = (fn) => async (req, res, next) => {
+    try {
+      const result = await fn(req, res);
+      if (result !== undefined) res.json(result);
+    } catch (err) {
+      next(err);
+    }
+  };
+
+  /** Async middleware: run fn, then continue to the next handler. */
+  const step = (fn) => async (req, res, next) => {
+    try {
+      await fn(req, res);
+      next();
+    } catch (err) {
+      next(err);
+    }
+  };
+
+  app.use('/api', step(async () => { await app.locals.ready; }));
 
   app.use(express.json({ limit: '200kb' }));
 
@@ -238,33 +330,23 @@ function createApp({ dbFile = ':memory:', trustProxy = false, admin: envAdmin = 
     next();
   });
 
-  app.use('/api', (req, res, next) => {
+  app.use('/api', step(async (req) => {
     const token = readCookie(req, COOKIE);
-    if (token) {
-      const s = q.session.get(token);
-      if (s && s.expires_at > now()) {
-        const user = q.userById.get(s.user_id);
-        if (user && user.active) {
-          req.user = user;
-          req.sessionToken = token;
-        }
-      } else if (s) {
-        db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
+    if (!token) return;
+    const s = await db.get('SELECT * FROM sessions WHERE token = ?', [token]);
+    if (s && s.expires_at > now()) {
+      const user = await q.userById(s.user_id);
+      if (user && user.active) {
+        req.user = user;
+        req.sessionToken = token;
       }
+    } else if (s) {
+      await db.run('DELETE FROM sessions WHERE token = ?', [token]);
     }
-    next();
-  });
+  }));
 
   const auth = (req, res, next) => (req.user ? next() : res.status(401).json({ error: 'Please sign in' }));
   const admin = (req, res, next) => (req.user?.is_admin ? next() : res.status(403).json({ error: 'Admins only' }));
-  const route = (fn) => (req, res, next) => {
-    try {
-      const result = fn(req, res);
-      if (result !== undefined) res.json(result);
-    } catch (err) {
-      next(err);
-    }
-  };
 
   // Simple in-memory login throttle.
   const attempts = new Map();
@@ -277,122 +359,76 @@ function createApp({ dbFile = ':memory:', trustProxy = false, admin: envAdmin = 
     if (entry.count > 10) fail(429, 'Too many sign-in attempts. Try again in a few minutes.');
   }
 
-  /** Create the default levels and the first admin (Level 1). Only allowed on an empty database. */
-  function createFirstAdmin(name, uname, pw) {
-    return tx(db, () => {
-      if (q.userCount.get().n > 0) fail(409, 'Setup has already been completed');
-      const top = createLevel('Leadership');
-      createLevel('Team');
-      const { lastInsertRowid } = db.prepare(
-        'INSERT INTO users (username, name, password_hash, level_id, is_admin, color, created_at) VALUES (?, ?, ?, ?, 1, ?, ?)'
-      ).run(uname, name, hashPassword(pw), top, pick(AVATAR_COLORS), now());
-      return q.userById.get(lastInsertRowid);
-    });
-  }
-
-  /**
-   * Admin account from environment variables (BEAVER_ADMIN_*):
-   * created on an empty database; on an existing one its password is only reset when resetPassword is set.
-   */
-  function applyAdminFromEnv({ name, username: rawUsername, password: rawPassword, resetPassword }) {
-    const uname = username(rawUsername);
-    const pw = password(rawPassword);
-    if (q.userCount.get().n === 0) {
-      createFirstAdmin(str(name, { field: 'Name', max: 80 }) || uname, uname, pw);
-      return `Created admin account "${uname}"`;
-    }
-    const existing = q.userByName.get(uname);
-    if (!resetPassword) {
-      return existing
-        ? `Admin account "${uname}" already exists; its password was left unchanged`
-        : `Users already exist, so "${uname}" was not created (add members in Settings)`;
-    }
-    if (existing) {
-      db.prepare('UPDATE users SET password_hash = ?, is_admin = 1, active = 1 WHERE id = ?').run(hashPassword(pw), existing.id);
-      db.prepare('DELETE FROM sessions WHERE user_id = ?').run(existing.id);
-      return `Reset the password of "${uname}"`;
-    }
-    const top = q.levels.all()[0]?.id ?? createLevel('Leadership');
-    db.prepare(
-      'INSERT INTO users (username, name, password_hash, level_id, is_admin, color, created_at) VALUES (?, ?, ?, ?, 1, ?, ?)'
-    ).run(uname, str(name, { field: 'Name', max: 80 }) || uname, hashPassword(pw), top, pick(AVATAR_COLORS), now());
-    return `Created admin account "${uname}"`;
-  }
-
-  if (envAdmin?.username || envAdmin?.password) {
-    if (!envAdmin.username || !envAdmin.password) {
-      throw new Error('Set both BEAVER_ADMIN_USERNAME and BEAVER_ADMIN_PASSWORD (or neither).');
-    }
-    try {
-      app.locals.adminMessage = applyAdminFromEnv(envAdmin);
-    } catch (err) {
-      throw new Error(`Invalid admin settings: ${err.message}`);
-    }
-  }
-
   // ----- setup & auth -----
 
-  app.get('/api/setup', route(() => ({ needsSetup: q.userCount.get().n === 0 })));
+  app.get('/api/setup', route(async () => ({
+    needsSetup: (await q.userCount()) === 0,
+    ephemeral: !!app.locals.ephemeral,
+  })));
 
-  app.post('/api/setup', route((req, res) => {
+  app.post('/api/setup', route(async (req, res) => {
     const name = str(req.body.name, { field: 'Name', max: 80, required: true });
     const uname = username(req.body.username);
     const pw = password(req.body.password);
-    const user = createFirstAdmin(name, uname, pw);
-    startSession(res, req, user.id);
+    const user = await createFirstAdmin(name, uname, pw);
+    await startSession(res, req, user.id);
     return { user: publicUser(user) };
   }));
 
-  app.post('/api/login', route((req, res) => {
+  app.post('/api/login', route(async (req, res) => {
     const uname = str(req.body.username, { field: 'Username', max: 40, required: true });
     throttle(`${req.ip}|${uname.toLowerCase()}`);
-    const user = q.userByName.get(uname);
+    const user = await q.userByName(uname);
     const ok = user && user.active && verifyPassword(String(req.body.password ?? ''), user.password_hash);
     if (!ok) fail(401, 'Wrong username or password');
     attempts.delete(`${req.ip}|${uname.toLowerCase()}`);
-    db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(now());
-    startSession(res, req, user.id);
+    await db.run('DELETE FROM sessions WHERE expires_at < ?', [now()]);
+    await startSession(res, req, user.id);
     return { user: publicUser(user) };
   }));
 
-  app.post('/api/logout', route((req, res) => {
-    if (req.sessionToken) db.prepare('DELETE FROM sessions WHERE token = ?').run(req.sessionToken);
+  app.post('/api/logout', route(async (req, res) => {
+    if (req.sessionToken) await db.run('DELETE FROM sessions WHERE token = ?', [req.sessionToken]);
     res.clearCookie(COOKIE, { path: '/' });
     return { ok: true };
   }));
 
   // ----- me -----
 
-  app.get('/api/me', auth, route((req) => {
-    const assignable = db.prepare('SELECT * FROM users WHERE active = 1').all()
-      .filter((u) => canAssign(req.user, u)).map((u) => u.id);
+  app.get('/api/me', auth, route(async (req) => {
+    const assignable = await db.all(`
+      SELECT id FROM users WHERE active = 1 AND (
+        id = :me OR level_id IN (SELECT to_level FROM level_rules WHERE from_level = :level)
+      )`, { me: req.user.id, level: req.user.level_id ?? -1 });
     return {
       user: publicUser(req.user),
       prefs: JSON.parse(req.user.prefs || '{}'),
-      assignable,
+      assignable: assignable.map((u) => u.id),
       noteColors: NOTE_COLORS,
     };
   }));
 
-  app.put('/api/me', auth, route((req) => {
+  app.put('/api/me', auth, route(async (req) => {
     const name = str(req.body.name, { field: 'Name', max: 80 });
     if (name !== undefined) {
       if (!name) fail(400, 'Name is required');
-      db.prepare('UPDATE users SET name = ? WHERE id = ?').run(name, req.user.id);
+      await db.run('UPDATE users SET name = ? WHERE id = ?', [name, req.user.id]);
     }
     if (req.body.prefs !== undefined) {
       const merged = { ...JSON.parse(req.user.prefs || '{}'), ...cleanPrefs(req.body.prefs) };
-      db.prepare('UPDATE users SET prefs = ? WHERE id = ?').run(JSON.stringify(merged), req.user.id);
+      await db.run('UPDATE users SET prefs = ? WHERE id = ?', [JSON.stringify(merged), req.user.id]);
     }
-    const u = q.userById.get(req.user.id);
+    const u = await q.userById(req.user.id);
     return { user: publicUser(u), prefs: JSON.parse(u.prefs) };
   }));
 
-  app.put('/api/me/password', auth, route((req) => {
+  app.put('/api/me/password', auth, route(async (req) => {
     if (!verifyPassword(String(req.body.currentPassword ?? ''), req.user.password_hash)) fail(400, 'Current password is wrong');
     const pw = password(req.body.newPassword);
-    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hashPassword(pw), req.user.id);
-    db.prepare('DELETE FROM sessions WHERE user_id = ? AND token <> ?').run(req.user.id, req.sessionToken);
+    await db.batch([
+      ['UPDATE users SET password_hash = ? WHERE id = ?', [hashPassword(pw), req.user.id]],
+      ['DELETE FROM sessions WHERE user_id = ? AND token <> ?', [req.user.id, req.sessionToken]],
+    ]);
     return { ok: true };
   }));
 
@@ -400,119 +436,122 @@ function createApp({ dbFile = ':memory:', trustProxy = false, admin: envAdmin = 
 
   app.get('/api/levels', auth, route(() => levelsWithRules()));
 
-  app.post('/api/levels', auth, admin, route((req) => {
+  app.post('/api/levels', auth, admin, route(async (req) => {
     const name = str(req.body.name, { field: 'Level name', max: 60, required: true });
-    tx(db, () => createLevel(name));
+    await db.batch(addLevelStatements(name));
     return levelsWithRules();
   }));
 
-  app.put('/api/levels/:id', auth, admin, route((req) => {
-    const level = q.levelById.get(Number(req.params.id)) || fail(404, 'Level not found');
-    tx(db, () => {
-      const name = str(req.body.name, { field: 'Level name', max: 60 });
-      if (name !== undefined) {
-        if (!name) fail(400, 'Level name is required');
-        db.prepare('UPDATE levels SET name = ? WHERE id = ?').run(name, level.id);
+  app.put('/api/levels/:id', auth, admin, route(async (req) => {
+    const level = (await q.levelById(Number(req.params.id))) || fail(404, 'Level not found');
+    const statements = [];
+    const name = str(req.body.name, { field: 'Level name', max: 60 });
+    if (name !== undefined) {
+      if (!name) fail(400, 'Level name is required');
+      statements.push(['UPDATE levels SET name = ? WHERE id = ?', [name, level.id]]);
+    }
+    if (req.body.canAssignTo !== undefined) {
+      if (!Array.isArray(req.body.canAssignTo)) fail(400, 'canAssignTo must be a list');
+      const valid = new Set((await q.levels()).map((l) => l.id));
+      statements.push(['DELETE FROM level_rules WHERE from_level = ?', [level.id]]);
+      for (const to of req.body.canAssignTo) {
+        if (!valid.has(to)) fail(400, 'Unknown level in canAssignTo');
+        statements.push(['INSERT OR IGNORE INTO level_rules (from_level, to_level) VALUES (?, ?)', [level.id, to]]);
       }
-      if (req.body.canAssignTo !== undefined) {
-        if (!Array.isArray(req.body.canAssignTo)) fail(400, 'canAssignTo must be a list');
-        const valid = new Set(q.levels.all().map((l) => l.id));
-        db.prepare('DELETE FROM level_rules WHERE from_level = ?').run(level.id);
-        const ins = db.prepare('INSERT OR IGNORE INTO level_rules (from_level, to_level) VALUES (?, ?)');
-        for (const to of req.body.canAssignTo) {
-          if (!valid.has(to)) fail(400, 'Unknown level in canAssignTo');
-          ins.run(level.id, to);
-        }
-      }
-    });
+    }
+    if (statements.length) await db.batch(statements);
     return levelsWithRules();
   }));
 
-  app.post('/api/levels/reorder', auth, admin, route((req) => {
+  app.post('/api/levels/reorder', auth, admin, route(async (req) => {
     const ids = req.body.ids;
-    const existing = q.levels.all().map((l) => l.id);
+    const existing = (await q.levels()).map((l) => l.id);
     if (!Array.isArray(ids) || ids.length !== existing.length || !existing.every((id) => ids.includes(id))) {
       fail(400, 'ids must list every level exactly once');
     }
-    tx(db, () => ids.forEach((id, i) => db.prepare('UPDATE levels SET rank = ? WHERE id = ?').run(i + 1, id)));
+    await db.batch(ids.map((id, i) => ['UPDATE levels SET rank = ? WHERE id = ?', [i + 1, id]]));
     return levelsWithRules();
   }));
 
-  app.delete('/api/levels/:id', auth, admin, route((req) => {
-    const level = q.levelById.get(Number(req.params.id)) || fail(404, 'Level not found');
-    const { n } = db.prepare('SELECT COUNT(*) AS n FROM users WHERE level_id = ? AND active = 1').get(level.id);
+  app.delete('/api/levels/:id', auth, admin, route(async (req) => {
+    const level = (await q.levelById(Number(req.params.id))) || fail(404, 'Level not found');
+    const { n } = await db.get('SELECT COUNT(*) AS n FROM users WHERE level_id = ? AND active = 1', [level.id]);
     if (n > 0) fail(409, `Move the ${n} member(s) in "${level.name}" to another level first`);
-    tx(db, () => {
-      db.prepare('UPDATE users SET level_id = NULL WHERE level_id = ?').run(level.id);
-      db.prepare('DELETE FROM levels WHERE id = ?').run(level.id);
-      renumberLevels();
-    });
+    await db.batch([
+      ['UPDATE users SET level_id = NULL WHERE level_id = ?', [level.id]],
+      ['DELETE FROM level_rules WHERE from_level = ? OR to_level = ?', [level.id, level.id]],
+      ['DELETE FROM levels WHERE id = ?', [level.id]],
+      // Close the gap so ranks stay 1, 2, 3, ...
+      [`UPDATE levels SET rank = (
+          SELECT COUNT(*) FROM levels l2 WHERE l2.rank < levels.rank OR (l2.rank = levels.rank AND l2.id <= levels.id))`],
+    ]);
     return levelsWithRules();
   }));
 
   // ----- users -----
 
-  app.get('/api/users', auth, route(() => db.prepare('SELECT * FROM users ORDER BY name COLLATE NOCASE').all().map(publicUser)));
+  app.get('/api/users', auth, route(async () => (await db.all('SELECT * FROM users ORDER BY name COLLATE NOCASE')).map(publicUser)));
 
-  function levelIdOrFail(value) {
+  async function levelIdOrFail(value) {
     const id = Number(value);
-    if (!q.levelById.get(id)) fail(400, 'Choose a valid level');
+    if (!(await q.levelById(id))) fail(400, 'Choose a valid level');
     return id;
   }
 
-  app.post('/api/users', auth, admin, route((req) => {
+  app.post('/api/users', auth, admin, route(async (req) => {
     const name = str(req.body.name, { field: 'Name', max: 80, required: true });
     const uname = username(req.body.username);
     const pw = password(req.body.password);
-    const levelId = levelIdOrFail(req.body.levelId);
-    if (q.userByName.get(uname)) fail(409, 'That username is taken');
-    const { lastInsertRowid } = db.prepare(
-      'INSERT INTO users (username, name, password_hash, level_id, is_admin, color, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
-    ).run(uname, name, hashPassword(pw), levelId, req.body.isAdmin ? 1 : 0, pick(AVATAR_COLORS), now());
-    return publicUser(q.userById.get(lastInsertRowid));
+    const levelId = await levelIdOrFail(req.body.levelId);
+    if (await q.userByName(uname)) fail(409, 'That username is taken');
+    const { lastInsertRowid } = await db.run(
+      'INSERT INTO users (username, name, password_hash, level_id, is_admin, color, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [uname, name, hashPassword(pw), levelId, req.body.isAdmin ? 1 : 0, pick(AVATAR_COLORS), now()],
+    );
+    return publicUser(await q.userById(lastInsertRowid));
   }));
 
-  app.put('/api/users/:id', auth, admin, route((req) => {
-    const user = q.userById.get(Number(req.params.id)) || fail(404, 'Member not found');
+  app.put('/api/users/:id', auth, admin, route(async (req) => {
+    const user = (await q.userById(Number(req.params.id))) || fail(404, 'Member not found');
     const self = user.id === req.user.id;
-    tx(db, () => {
-      const name = str(req.body.name, { field: 'Name', max: 80 });
-      if (name) db.prepare('UPDATE users SET name = ? WHERE id = ?').run(name, user.id);
-      if (req.body.levelId !== undefined) {
-        db.prepare('UPDATE users SET level_id = ? WHERE id = ?').run(levelIdOrFail(req.body.levelId), user.id);
-      }
-      if (req.body.isAdmin !== undefined) {
-        if (self && !req.body.isAdmin) fail(400, 'You cannot remove your own admin rights');
-        db.prepare('UPDATE users SET is_admin = ? WHERE id = ?').run(req.body.isAdmin ? 1 : 0, user.id);
-      }
-      if (req.body.active !== undefined) {
-        if (self && !req.body.active) fail(400, 'You cannot deactivate yourself');
-        db.prepare('UPDATE users SET active = ? WHERE id = ?').run(req.body.active ? 1 : 0, user.id);
-        if (!req.body.active) db.prepare('DELETE FROM sessions WHERE user_id = ?').run(user.id);
-      }
-      if (req.body.password !== undefined) {
-        db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hashPassword(password(req.body.password)), user.id);
-        if (!self) db.prepare('DELETE FROM sessions WHERE user_id = ?').run(user.id);
-      }
-    });
-    return publicUser(q.userById.get(user.id));
+    const statements = [];
+    const name = str(req.body.name, { field: 'Name', max: 80 });
+    if (name) statements.push(['UPDATE users SET name = ? WHERE id = ?', [name, user.id]]);
+    if (req.body.levelId !== undefined) {
+      statements.push(['UPDATE users SET level_id = ? WHERE id = ?', [await levelIdOrFail(req.body.levelId), user.id]]);
+    }
+    if (req.body.isAdmin !== undefined) {
+      if (self && !req.body.isAdmin) fail(400, 'You cannot remove your own admin rights');
+      statements.push(['UPDATE users SET is_admin = ? WHERE id = ?', [req.body.isAdmin ? 1 : 0, user.id]]);
+    }
+    if (req.body.active !== undefined) {
+      if (self && !req.body.active) fail(400, 'You cannot deactivate yourself');
+      statements.push(['UPDATE users SET active = ? WHERE id = ?', [req.body.active ? 1 : 0, user.id]]);
+      if (!req.body.active) statements.push(['DELETE FROM sessions WHERE user_id = ?', [user.id]]);
+    }
+    if (req.body.password !== undefined) {
+      statements.push(['UPDATE users SET password_hash = ? WHERE id = ?', [hashPassword(password(req.body.password)), user.id]]);
+      if (!self) statements.push(['DELETE FROM sessions WHERE user_id = ?', [user.id]]);
+    }
+    if (statements.length) await db.batch(statements);
+    return publicUser(await q.userById(user.id));
   }));
 
   // ----- tasks -----
 
-  app.get('/api/tasks', auth, route((req) => {
+  app.get('/api/tasks', auth, route(async (req) => {
     const me = req.user.id;
     const member = req.query.member ? Number(req.query.member) : null;
     let rows;
     if (member) {
-      const other = q.userById.get(member) || fail(404, 'Member not found');
-      const oversee = canOversee(req.user, other) ? 1 : 0;
-      rows = db.prepare(`
+      const other = (await q.userById(member)) || fail(404, 'Member not found');
+      const oversee = (await canOversee(req.user, other)) ? 1 : 0;
+      rows = await db.all(`
         SELECT * FROM tasks WHERE
           (created_by = :me AND assigned_to = :x AND :me <> :x)
           OR (created_by = :x AND assigned_to = :me AND is_private = 0 AND :me <> :x)
           OR (:oversee = 1 AND created_by = :x AND assigned_to = :x AND is_private = 0)
-      `).all({ me, x: other.id, oversee });
+      `, { me, x: other.id, oversee });
     } else {
       const scope = req.query.scope || 'mine';
       const where = {
@@ -520,23 +559,31 @@ function createApp({ dbFile = ':memory:', trustProxy = false, admin: envAdmin = 
         private: 'created_by = :me AND is_private = 1',
         delegated: 'created_by = :me AND assigned_to <> :me',
       }[scope] || fail(400, 'Unknown scope');
-      rows = db.prepare(`SELECT * FROM tasks WHERE ${where}`).all({ me });
+      rows = await db.all(`SELECT * FROM tasks WHERE ${where}`, { me });
     }
     return rows.map(serializeTask);
   }));
 
   // Per-user open-task counts for the sidebar.
-  app.get('/api/counts', auth, route((req) => {
+  app.get('/api/counts', auth, route(async (req) => {
     const me = req.user.id;
-    const one = (sql) => db.prepare(sql).get({ me }).n;
-    const perMember = db.prepare(`
-      SELECT assigned_to AS id, COUNT(*) AS n FROM tasks
-      WHERE created_by = :me AND assigned_to <> :me AND status = 'open' GROUP BY assigned_to
-    `).all({ me });
+    const [counts, perMember] = await Promise.all([
+      db.get(`
+        SELECT
+          SUM(assigned_to = :me AND is_private = 0) AS mine,
+          SUM(created_by = :me AND is_private = 1) AS private,
+          SUM(created_by = :me AND assigned_to <> :me) AS delegated
+        FROM tasks WHERE status = 'open' AND (assigned_to = :me OR created_by = :me)
+      `, { me }),
+      db.all(`
+        SELECT assigned_to AS id, COUNT(*) AS n FROM tasks
+        WHERE created_by = :me AND assigned_to <> :me AND status = 'open' GROUP BY assigned_to
+      `, { me }),
+    ]);
     return {
-      mine: one("SELECT COUNT(*) AS n FROM tasks WHERE assigned_to = :me AND is_private = 0 AND status = 'open'"),
-      private: one("SELECT COUNT(*) AS n FROM tasks WHERE created_by = :me AND is_private = 1 AND status = 'open'"),
-      delegated: one("SELECT COUNT(*) AS n FROM tasks WHERE created_by = :me AND assigned_to <> :me AND status = 'open'"),
+      mine: counts.mine || 0,
+      private: counts.private || 0,
+      delegated: counts.delegated || 0,
       members: Object.fromEntries(perMember.map((r) => [r.id, r.n])),
     };
   }));
@@ -559,32 +606,32 @@ function createApp({ dbFile = ':memory:', trustProxy = false, admin: envAdmin = 
     };
   }
 
-  app.post('/api/tasks', auth, route((req) => {
+  app.post('/api/tasks', auth, route(async (req) => {
     const f = readTaskFields(req.body);
     if (!f.title && !f.body) fail(400, 'Write something on the note first');
     let assignee = req.user;
     if (req.body.assignedTo !== undefined && req.body.assignedTo !== null && Number(req.body.assignedTo) !== req.user.id) {
-      assignee = q.userById.get(Number(req.body.assignedTo));
-      if (!canAssign(req.user, assignee)) fail(403, 'Your level is not allowed to submit tasks to this member');
+      assignee = await q.userById(Number(req.body.assignedTo));
+      if (!(await canAssign(req.user, assignee))) fail(403, 'Your level is not allowed to submit tasks to this member');
     }
     const isPrivate = assignee.id === req.user.id && f.isPrivate ? 1 : 0;
     const t = now();
     const status = f.status || 'open';
-    const { lastInsertRowid } = db.prepare(`
+    const { lastInsertRowid } = await db.run(`
       INSERT INTO tasks (title, body, created_by, assigned_to, is_private, due_date, due_time, urgent, status, completed_at,
                          color, width, height, font_family, font_size, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
+    `, [
       f.title || '', f.body || '', req.user.id, assignee.id, isPrivate,
       f.dueDate ?? null, f.dueDate ? (f.dueTime ?? null) : null, f.urgent ? 1 : 0, status, status === 'done' ? t : null,
       f.color ?? pick(NOTE_COLORS), f.width ?? null, f.height ?? null, f.fontFamily || null, f.fontSize ?? null, t, t,
-    );
-    return serializeTask(q.taskById.get(lastInsertRowid));
+    ]);
+    return serializeTask(await q.taskById(lastInsertRowid));
   }));
 
-  app.put('/api/tasks/:id', auth, route((req) => {
-    const task = q.taskById.get(Number(req.params.id));
-    if (!task || !canView(req.user, task)) fail(404, 'Task not found');
+  app.put('/api/tasks/:id', auth, route(async (req) => {
+    const task = await q.taskById(Number(req.params.id));
+    if (!task || !(await canView(req.user, task))) fail(404, 'Task not found');
     const isCreator = task.created_by === req.user.id;
     const isAssignee = task.assigned_to === req.user.id;
     if (!isCreator && !isAssignee) fail(403, 'You can only view this note');
@@ -616,8 +663,8 @@ function createApp({ dbFile = ':memory:', trustProxy = false, admin: envAdmin = 
     if (req.body.assignedTo !== undefined) {
       const target = Number(req.body.assignedTo ?? req.user.id);
       if (target !== task.assigned_to) {
-        const assignee = q.userById.get(target);
-        if (!canAssign(req.user, assignee)) fail(403, 'Your level is not allowed to submit tasks to this member');
+        const assignee = await q.userById(target);
+        if (!(await canAssign(req.user, assignee))) fail(403, 'Your level is not allowed to submit tasks to this member');
         sets.assigned_to = assignedTo = target;
       }
     }
@@ -632,15 +679,15 @@ function createApp({ dbFile = ':memory:', trustProxy = false, admin: envAdmin = 
 
     sets.updated_at = now();
     const cols = Object.keys(sets);
-    db.prepare(`UPDATE tasks SET ${cols.map((c) => `${c} = :${c}`).join(', ')} WHERE id = :id`).run({ ...sets, id: task.id });
-    return serializeTask(q.taskById.get(task.id));
+    await db.run(`UPDATE tasks SET ${cols.map((c) => `${c} = :${c}`).join(', ')} WHERE id = :id`, { ...sets, id: task.id });
+    return serializeTask(await q.taskById(task.id));
   }));
 
-  app.delete('/api/tasks/:id', auth, route((req) => {
-    const task = q.taskById.get(Number(req.params.id));
-    if (!task || !canView(req.user, task)) fail(404, 'Task not found');
+  app.delete('/api/tasks/:id', auth, route(async (req) => {
+    const task = await q.taskById(Number(req.params.id));
+    if (!task || !(await canView(req.user, task))) fail(404, 'Task not found');
     if (task.created_by !== req.user.id) fail(403, 'Only the person who wrote this note can delete it');
-    db.prepare('DELETE FROM tasks WHERE id = ?').run(task.id);
+    await db.run('DELETE FROM tasks WHERE id = ?', [task.id]);
     return { ok: true };
   }));
 

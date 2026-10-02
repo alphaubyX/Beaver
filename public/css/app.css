@@ -133,6 +133,18 @@ input[type=checkbox] { accent-color: var(--accent); width: 1.05rem; height: 1.05
 .avatar.sm { width: 26px; height: 26px; font-size: .68rem; }
 .avatar.xs { width: 18px; height: 18px; font-size: .55rem; }
 
+/* ---------- demo storage warning ---------- */
+.demo-banner {
+  display: flex; align-items: center; gap: .6rem; padding: .6rem 1.5rem;
+  background: #fff3cd; color: #5c4300; border-bottom: 1px solid #f0d78a; font-size: .9rem;
+}
+.demo-banner .icon { color: #b26a00; }
+@media (prefers-color-scheme: dark) {
+  .demo-banner { background: #3d3214; color: #f3dc9a; border-color: #5c4a1c; }
+  .demo-banner .icon { color: #ffb74d; }
+}
+@media (max-width: 760px) { .demo-banner { padding: .6rem 1rem; } }
+
 /* ---------- auth ---------- */
 .auth { min-height: 100vh; display: grid; place-items: center; padding: 1.5rem; }
 .auth-card {

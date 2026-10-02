@@ -12,16 +12,23 @@ const root = document.getElementById('app');
 
 // ---------- boot ----------
 
+let server = { needsSetup: false, ephemeral: false };
+
+/** Warning shown when the server keeps data in temporary storage (e.g. Vercel without a database). */
+const demoBanner = () => server.ephemeral && h('div', { class: 'demo-banner', role: 'status' },
+  icon('alert'), h('span', {}, h('strong', {}, 'Test mode: '),
+    'this server has no database connected, so notes and accounts can disappear at any time. Connect a Turso database to keep them.'));
+
 async function boot() {
   try {
+    server = await api.setupStatus();
     await loadSession();
     renderShell();
     await refresh();
     startTimers();
   } catch (err) {
     if (err instanceof ApiError && err.status === 401) {
-      const { needsSetup } = await api.setupStatus();
-      renderAuth(needsSetup);
+      renderAuth(server.needsSetup);
     } else {
       clear(root, h('div', { class: 'fatal' }, h('h1', {}, 'Cannot reach the Beaver server'), h('p', {}, err.message),
         h('button', { class: 'btn primary', onclick: () => location.reload() }, 'Try again')));
@@ -79,7 +86,7 @@ function renderAuth(needsSetup) {
   err,
   h('button', { class: 'btn primary wide', type: 'submit' }, needsSetup ? 'Create account' : 'Sign in'));
 
-  clear(root, h('main', { class: 'auth' }, form));
+  clear(root, demoBanner(), h('main', { class: 'auth' }, form));
   (needsSetup ? name : username).focus();
 }
 
@@ -115,7 +122,7 @@ function renderShell() {
     h('div', { class: 'layout' },
       els.sidebar,
       h('div', { class: 'scrim', onclick: () => document.body.classList.remove('nav-open') }),
-      h('main', { class: 'main' }, topbar, els.filters, els.content)));
+      h('main', { class: 'main' }, demoBanner(), topbar, els.filters, els.content)));
   renderSidebar();
 }
 

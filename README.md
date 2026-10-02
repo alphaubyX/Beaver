@@ -24,7 +24,7 @@ Beaver is a self-hosted task board where every task is a sticky note. It runs on
 
 ## Quick start
 
-You need **Node.js 22.13 or newer** (https://nodejs.org).
+You need **Node.js 22 or newer** (https://nodejs.org).
 
 ```bash
 npm install
@@ -55,7 +55,8 @@ Then go to **Settings**:
 |---------------|-------------------|---------|
 | `PORT`        | `3000`            | Port to listen on |
 | `HOST`        | `0.0.0.0`         | Interface to bind |
-| `BEAVER_DB`   | `./data/beaver.db`| Where the database file lives |
+| `BEAVER_DB`   | `./data/beaver.db`| Where the database lives: a file path, or a `libsql://` URL |
+| `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN` | *(none)* | A hosted Turso database (used on Vercel; overrides `BEAVER_DB`) |
 | `TRUST_PROXY` | *(off)*           | Set to `1` behind a reverse proxy that terminates HTTPS, so sign-in cookies are marked secure |
 | `BEAVER_ADMIN_USERNAME` | *(none)* | Admin login to create on first start |
 | `BEAVER_ADMIN_PASSWORD` | *(none)* | Its password (at least 6 characters) |
@@ -72,7 +73,7 @@ You can put any of these in a `.env` file next to `package.json`. `npm start` lo
 
 1. Install Node.js 22 LTS, copy this folder over, then run `npm install --omit=dev`.
 2. Run it as a background service, for example with [NSSM](https://nssm.cc):
-   `nssm install Beaver "C:\Program Files\nodejs\node.exe" "--disable-warning=ExperimentalWarning C:\Beaver\server\index.js"`.
+   `nssm install Beaver "C:\Program Files\nodejs\node.exe" "C:\Beaver\server\index.js"`.
    Alternatively, use `pm2` with `pm2-windows-startup`.
 3. Open the port in Windows Firewall, or put IIS or Caddy in front of it for HTTPS.
 
@@ -91,6 +92,25 @@ tasks.example.com {
   reverse_proxy localhost:3000
 }
 ```
+
+## Deploy to Vercel (for testing)
+
+Vercel doesn't keep files between requests, so Beaver needs a hosted database there. Turso is SQLite in the cloud, has a free plan, and plugs straight into Vercel.
+
+1. **Import the project.** In Vercel, click **Add New → Project**, pick the `beaver` GitHub repository and leave every build setting at its default. If you're testing a branch, open the project's **Settings → Git** afterwards and set it as the production branch, or open the branch's preview URL.
+2. **Add a database.** In the project, go to **Storage → Create Database** (or the Marketplace) and choose **Turso**. Connect it to the project. This adds `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` for you.
+   You can also create a database at https://turso.tech yourself and add those two variables by hand.
+3. **Add your login.** Under **Settings → Environment Variables**, add:
+
+   | Name | Value |
+   |---|---|
+   | `BEAVER_ADMIN_USERNAME` | your username, e.g. `admin` |
+   | `BEAVER_ADMIN_PASSWORD` | a strong password (at least 6 characters) |
+   | `BEAVER_ADMIN_NAME` | your display name (optional) |
+
+4. **Redeploy.** Go to **Deployments**, open the ⋯ menu on the latest deployment and click **Redeploy**, so the new variables take effect. Then open your `*.vercel.app` URL and sign in.
+
+If you skip step 2, Beaver still runs, but in **test mode**: a yellow banner warns you that notes and accounts may disappear whenever Vercel restarts the function.
 
 ## Windows desktop app
 
@@ -128,7 +148,8 @@ npm test      # API tests (node:test)
 
 Project layout:
 
-- `server/`: Express API with SQLite storage through the built-in `node:sqlite`.
+- `server/`: Express API. Storage is SQLite through libSQL: a local file, or a hosted Turso database.
+- `api/index.js` and `vercel.json`: the Vercel deployment.
 - `public/`: the web app, plain ES modules with no build step. Fonts are served locally from `@fontsource`.
 - `desktop/`: the Electron shell for Windows.
 - `test/`: API tests.

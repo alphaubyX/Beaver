@@ -6,6 +6,7 @@ const { createApp } = require('../server/app');
 
 async function startServer() {
   const app = createApp({ dbFile: ':memory:' });
+  await app.locals.ready;
   const server = await new Promise((resolve) => {
     const s = app.listen(0, '127.0.0.1', () => resolve(s));
   });
@@ -162,7 +163,8 @@ test('admin account from environment variables', async (t) => {
   };
 
   // Empty database: admin is created at Level 1.
-  let app = createApp({ dbFile, admin: { username: 'owner', password: 'first-pass', name: 'The Owner' } });
+  const make = async (opts) => { const a = createApp({ dbFile, ...opts }); await a.locals.ready; return a; };
+  let app = await make({ admin: { username: 'owner', password: 'first-pass', name: 'The Owner' } });
   assert.match(app.locals.adminMessage, /Created/);
   const first = await login(app, 'first-pass');
   assert.equal(first.status, 200);
@@ -170,12 +172,29 @@ test('admin account from environment variables', async (t) => {
   assert.equal(first.data.user.name, 'The Owner');
 
   // Restart with a different password: unchanged unless reset is requested.
-  app = createApp({ dbFile, admin: { username: 'owner', password: 'second-pass' } });
+  app = await make({ admin: { username: 'owner', password: 'second-pass' } });
   assert.equal((await login(app, 'second-pass')).status, 401);
-  app = createApp({ dbFile, admin: { username: 'owner', password: 'second-pass', resetPassword: true } });
+  app = await make({ admin: { username: 'owner', password: 'second-pass', resetPassword: true } });
   assert.equal((await login(app, 'second-pass')).status, 200);
 
   // Bad settings stop the server with a clear message.
-  assert.throws(() => createApp({ dbFile, admin: { username: 'owner' } }), /BEAVER_ADMIN_PASSWORD/);
-  assert.throws(() => createApp({ dbFile, admin: { username: 'owner', password: '123' } }), /at least 6/);
+  await assert.rejects(make({ admin: { username: 'owner' } }), /BEAVER_ADMIN_PASSWORD/);
+  await assert.rejects(make({ admin: { username: 'owner', password: '123' } }), /at least 6/);
+});
+
+test('settings from environment variables', () => {
+  const { configFromEnv } = require('../server/config');
+  const local = configFromEnv({});
+  assert.match(local.dbFile, /data[\\/]beaver\.db$/);
+  assert.equal(local.ephemeral, false);
+
+  const vercelNoDb = configFromEnv({ VERCEL: '1' });
+  assert.equal(vercelNoDb.dbFile, '/tmp/beaver.db');
+  assert.equal(vercelNoDb.ephemeral, true);
+  assert.equal(vercelNoDb.trustProxy, 1);
+
+  const turso = configFromEnv({ VERCEL: '1', TURSO_DATABASE_URL: 'libsql://x.turso.io', TURSO_AUTH_TOKEN: 'tok' });
+  assert.equal(turso.dbFile, 'libsql://x.turso.io');
+  assert.equal(turso.dbAuthToken, 'tok');
+  assert.equal(turso.ephemeral, false);
 });
