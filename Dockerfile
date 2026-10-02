@@ -7,4 +7,4 @@ COPY public ./public
 ENV NODE_ENV=production PORT=3000 BEAVER_DB=/data/beaver.db
 VOLUME /data
 EXPOSE 3000
-CMD ["node", "server/index.js"]
+CMD ["node", "--disable-warning=ExperimentalWarning", "server/index.js"]

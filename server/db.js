@@ -2,6 +2,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const { DatabaseSync } = require('node:sqlite');
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS levels (
@@ -61,53 +62,26 @@ CREATE INDEX IF NOT EXISTS tasks_assigned ON tasks(assigned_to);
 CREATE INDEX IF NOT EXISTS tasks_created  ON tasks(created_by);
 `;
 
-/**
- * Turn a BEAVER_DB value into a libSQL URL.
- * Accepts ":memory:", a file path, or a URL (file:, libsql://, https://).
- */
-function toUrl(location) {
-  if (location === ':memory:') return ':memory:';
-  if (/^(file:|libsql:|https?:|wss?:)/i.test(location)) return location;
-  const abs = path.resolve(location);
-  fs.mkdirSync(path.dirname(abs), { recursive: true });
-  return `file:${abs}`;
+function openDb(file) {
+  if (file !== ':memory:') fs.mkdirSync(path.dirname(file), { recursive: true });
+  const db = new DatabaseSync(file);
+  db.exec('PRAGMA foreign_keys = ON;');
+  if (file !== ':memory:') db.exec('PRAGMA journal_mode = WAL;');
+  db.exec(SCHEMA);
+  return db;
 }
 
-// libSQL rejects undefined arguments; treat them as NULL.
-const clean = (args = []) => (Array.isArray(args)
-  ? args.map((v) => (v === undefined ? null : v))
-  : Object.fromEntries(Object.entries(args).map(([k, v]) => [k, v === undefined ? null : v])));
-
-/**
- * Open the database. Works with a local SQLite file or a remote libSQL/Turso database.
- * Returns a small async helper API: get / all / run / batch.
- */
-async function openDb(location, { authToken } = {}) {
-  const url = toUrl(location);
-  // Remote databases use the pure-JavaScript client (no native module needed, e.g. on Vercel).
-  const local = url === ':memory:' || url.startsWith('file:');
-  const { createClient } = local ? require('@libsql/client') : require('@libsql/client/web');
-  const client = createClient({ url, authToken: authToken || undefined });
-  if (url.startsWith('file:')) await client.execute('PRAGMA journal_mode = WAL');
-  await client.executeMultiple(SCHEMA);
-
-  const exec = (sql, args) => client.execute({ sql, args: clean(args) });
-  return {
-    url,
-    client,
-    get: async (sql, args) => (await exec(sql, args)).rows[0],
-    all: async (sql, args) => (await exec(sql, args)).rows,
-    run: async (sql, args) => {
-      const r = await exec(sql, args);
-      return { changes: r.rowsAffected, lastInsertRowid: r.lastInsertRowid === undefined ? undefined : Number(r.lastInsertRowid) };
-    },
-    /** Run several statements atomically. Each item is [sql, args]. */
-    batch: async (statements) => {
-      const results = await client.batch(statements.map(([sql, args]) => ({ sql, args: clean(args) })), 'write');
-      return results.map((r) => ({ changes: r.rowsAffected, lastInsertRowid: r.lastInsertRowid === undefined ? undefined : Number(r.lastInsertRowid) }));
-    },
-    close: () => client.close(),
-  };
+/** Run fn inside a transaction; rolls back if it throws. */
+function tx(db, fn) {
+  db.exec('BEGIN');
+  try {
+    const result = fn();
+    db.exec('COMMIT');
+    return result;
+  } catch (err) {
+    db.exec('ROLLBACK');
+    throw err;
+  }
 }
 
-module.exports = { openDb, toUrl };
+module.exports = { openDb, tx };
