@@ -1,0 +1,39 @@
+{
+  "name": "beaver-desktop",
+  "productName": "Beaver",
+  "version": "1.0.0",
+  "description": "Beaver sticky-note tasks for Windows",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win nsis portable"
+  },
+  "devDependencies": {
+    "electron": "^44.0.0",
+    "electron-builder": "^26.0.0"
+  },
+  "build": {
+    "appId": "app.beaver.desktop",
+    "productName": "Beaver",
+    "files": [
+      "main.js",
+      "preload.js",
+      "setup.html",
+      "icon.svg",
+      "icon.png"
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "icon": "icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  },
+  "license": "MIT"
+}

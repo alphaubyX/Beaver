@@ -1,0 +1,23 @@
+{
+  "name": "beaver",
+  "version": "1.0.0",
+  "description": "Self-hosted sticky-note task board for you and your team",
+  "private": true,
+  "main": "server/index.js",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning server/index.js",
+    "dev": "node --disable-warning=ExperimentalWarning --watch server/index.js",
+    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.js"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@fontsource/caveat": "^5.3.0",
+    "@fontsource/indie-flower": "^5.3.0",
+    "@fontsource/kalam": "^5.3.0",
+    "@fontsource/patrick-hand": "^5.3.0",
+    "express": "^5.2.1"
+  }
+}
